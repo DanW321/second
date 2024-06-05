@@ -1,0 +1,153 @@
+// CALCULATING PREDICTOR VARIABLES FOR RANDOM FOREST TRAINING AND PREDICTION
+// Author: Dan Wexler
+// Date: 2024-04-19
+
+// This script takes a collection of disturbance patches generated using
+// LandTrendr and calculates predictor variables for each patch.
+// A few examples of predictor variables are maximum elevation, the
+// average distance to the nearest stream, and the minimum slope. These
+// values will help train the random forest model. Below is a list of the 
+// inputs and outputs.
+// INPUTS:
+// 1) the LandTrendr disturbance patches consisting of a .dbf, .prj, .shp 
+// and .shx file. (UPLOAD)
+// OUTPUTS: 
+// 1) a .csv file where each row is a polygon and each column is the
+//    value of a certain predictor variable for that polygon.
+// The LandTrendr disturbance patches, as well as all other assets,
+// can be uploaded to Google Earth Engine (GEE) using the "NEW" button
+// in the "Assets" tab. The output will be saved to the Google Drive
+// folder of the user's choosing. Section 1 is the only section that
+// requires user input, barring more involved modification of the script. 
+// Expect multiple hours of runtime.
+
+// (1) INFORMATION TO BE ENTERED BY THE USER
+// enter the name of the park (MORA, OLYM, or NOCA)
+var park = 'NOCA';
+// enter the filename for the disturbance patches
+var patches_file = 'NOCA_disturbance_patches';
+// enter the minimum mapping unit
+var mmu = '5';
+// enter the input index used to run LandTrendr
+var index = 'NBR';
+// enter the first year of the analysis
+var start_yr = '1987';
+// enter the last year of the analysis
+var end_yr = '2023';
+// enter the desired name of the file output
+var file_name = 'NOCA_predictors';
+// enter the Google Drive folder to which the output will be saved
+var folder_name = 'predictors';
+
+// (2) IMPORTING DATA
+// loads the boundary of the study area
+var bounds = ee.FeatureCollection('projects/ee-nps/assets/' + park + '_study_area');
+// loads the disturbance polygons
+var patches = ee.FeatureCollection('projects/ee-nps/assets/' + patches_file);
+// removes disturbance polygons that do not intersect with the study area
+var patches = ee.FeatureCollection(patches.filterBounds(bounds.geometry()));
+
+// (3) LOADING AND DERIVING IMAGES USED TO CALCULATE POLYGONAL STATISTICS
+// loads one of two elevation images depending on if the park is NOCA
+var elev_img = ee.Image(ee.Algorithms.If(ee.String(park).equals('NOCA'), 
+                        ee.Image('projects/ee-nps/assets/NOCA_elevation'), 
+                        ee.Image('USGS/3DEP/10m').select('elevation')));
+var elev_img = elev_img.rename('elevation');
+// generates a slope image from elevation
+var slope_img = ee.Terrain.slope(elev_img);
+// generates an apsect image from elevation
+var aspect_img = ee.Terrain.aspect(elev_img);
+// generates an eastness image from aspect
+var eastness_img = aspect_img.multiply(Math.PI / 180).sin();
+// generates a northness image from aspect
+var northness_img = aspect_img.multiply(Math.PI / 180).cos();
+// generates topographic position index images based on radius parameter 
+var calc_tpi = function(radius) {
+  var elev_mean = elev_img.reduceNeighborhood({
+    reducer: ee.Reducer.mean(),
+    kernel: ee.Kernel.circle(radius, 'meters'),
+  });
+  var tpi = elev_img.subtract(elev_mean);
+  return tpi.rename('tpi');
+};
+var tpi500_img = calc_tpi(500);
+var tpi2000_img = calc_tpi(2000);
+// generates a distance to stream image from loaded stream data
+var streams = ee.FeatureCollection('projects/ee-nps/assets/' + park + '_streams');
+var stream_img = ee.Image(0).paint(streams, 1);
+var kernel_size = 7665;
+var dist_stream_img = stream_img.distance(ee.Kernel.euclidean(kernel_size, 'meters'));
+// loads topographic convergence index data
+var tci_img = ee.Image('projects/ee-nps/assets/' + park + '_tci');
+
+// (4) FUNCTIONS THAT CALCULATE VALUES FOR DISTURBANCE POLYGONS
+// a function that generates a unique name for a polygon
+var create_name = function(feature) {
+  var year = feature.get('yod');
+  var id = feature.get('annualID');
+  return feature.set({patch_name: ee.String(park).cat('_').cat(mmu).cat('_').cat(index).
+    cat('_').cat(start_yr).cat('_').cat(end_yr).cat('_').cat(year).cat('_').cat(id)});
+};
+// a function that adds the park name as a variable
+var add_park_name = function(feature) {
+  return feature.set({park: park});
+};
+// a function that calculates a perimeter to area ratio for a polygon
+var paratio = function(feature) {
+  var area = feature.area();
+  var perimeter = feature.perimeter();
+  var paratio = area.divide(perimeter.multiply(0.282).pow(2));
+  return feature.set({paratio: paratio});
+};
+// a function that gets the latitude or longitude of a polygon's centroid
+var latlon = function(property_name, index) {
+  var map = function(feature) {
+    var coord = feature.geometry().centroid().coordinates().get(index);
+    return feature.set(property_name, coord);
+  };
+  return map;
+};
+// a general function that calculates the value of a predictor variable 
+// for a polygon by sampling an image
+var calc = function(img, reducer, property_name, band_name) {
+  var map = function(feature) {
+    var reduced = img.reduceRegion({
+      geometry: feature.geometry(),
+      reducer: reducer,
+      scale: 30
+    });
+    return feature.set(property_name, reduced.get(band_name));
+  };
+  return map;
+};
+
+// (5) RUNNING THE ABOVE FUNCTIONS FOR ALL POLYGONS
+patches = patches.map(create_name);
+patches = patches.map(add_park_name);
+patches = patches.map(paratio);
+patches = patches.map(latlon('latitude', 1));
+patches = patches.map(latlon('longitude', 0));
+patches = patches.map(calc(elev_img, ee.Reducer.mean(), 'elev_mean', 'elevation'));
+patches = patches.map(calc(elev_img, ee.Reducer.min(), 'elev_min', 'elevation'));
+patches = patches.map(calc(elev_img, ee.Reducer.max(), 'elev_max', 'elevation'));
+patches = patches.map(calc(slope_img, ee.Reducer.mean(), 'slope_mean', 'slope'));
+patches = patches.map(calc(slope_img, ee.Reducer.min(), 'slope_min', 'slope'));
+patches = patches.map(calc(slope_img, ee.Reducer.max(), 'slope_max', 'slope'));
+patches = patches.map(calc(eastness_img, ee.Reducer.mean(), 'eastness', 'aspect'));
+patches = patches.map(calc(northness_img, ee.Reducer.mean(), 'northness', 'aspect'));
+patches = patches.map(calc(tpi500_img, ee.Reducer.mean(), 'tpi500_mean', 'tpi'));
+patches = patches.map(calc(tpi500_img, ee.Reducer.stdDev(), 'tpi500_std', 'tpi'));
+patches = patches.map(calc(tpi2000_img, ee.Reducer.mean(), 'tpi2000_mean', 'tpi'));
+patches = patches.map(calc(tpi2000_img, ee.Reducer.stdDev(), 'tpi2000_std', 'tpi'));
+patches = patches.map(calc(dist_stream_img, ee.Reducer.mean(), 'dist_stream_mean', 'constant'));
+patches = patches.map(calc(dist_stream_img, ee.Reducer.stdDev(), 'dist_stream_std', 'constant'));
+patches = patches.map(calc(tci_img, ee.Reducer.mean(), 'tci_mean', 'b1'));
+patches = patches.map(calc(tci_img, ee.Reducer.stdDev(), 'tci_std', 'b1'));
+print(patches.toList(1).get(0));
+
+// (6) EXPORTING PREDICTOR VARIABLES TO GOOGLE DRIVE
+Export.table.toDrive({
+    collection: patches,
+    description: file_name,
+    folder: folder_name,
+});
